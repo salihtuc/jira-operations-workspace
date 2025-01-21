@@ -1,0 +1,134 @@
+import groovy.json.JsonSlurper
+import groovy.json.JsonOutput
+
+def maxRetries = 4
+int lastRetryDelayMillis = 5000
+int maxRetryDelayMillis = 30000
+def jitterMultiplierRange = [0.7, 1.3]
+
+// Function to add jitter
+long addJitter(long delayMillis, List<Double> jitterMultiplierRange) {
+    def jitterMultiplier = jitterMultiplierRange[0] + (Math.random() * (jitterMultiplierRange[1] - jitterMultiplierRange[0]))
+    return (delayMillis * jitterMultiplier) as long
+}
+
+def callApiWithRetry(String method, String endpoint, Map body = [:], Map queryParams = [:], int retryCount = 0, List<Double> jitterMultiplierRange = [0.7, 1.3]) {
+    def response
+    try {
+        def request = method == "GET" ? get(endpoint) : post(endpoint)
+
+        queryParams.each { k, v ->
+            request.queryString(k, v)
+        }
+
+        if (body) {
+            request.header("Content-Type", "application/json")
+                        .body(body)
+        }
+
+        response = request.asObject(Map)
+
+        if (response.status == 200 || response.status == 201) {
+            return response.body
+        } else if (response.status == 429 || response.headers["Retry-After"]) {
+            long retryDelayMillis = response.headers["Retry-After"] ? (response.headers["Retry-After"] as int) * 1000 : Math.min(2 * lastRetryDelayMillis, maxRetryDelayMillis)
+            retryDelayMillis = addJitter(retryDelayMillis, jitterMultiplierRange)
+
+            if (retryCount < maxRetries) {
+                logger.warn("Rate limit hit. Retrying after ${retryDelayMillis}ms. Retry attempt: ${retryCount + 1}")
+                Thread.sleep(retryDelayMillis)
+                return callApiWithRetry(method, endpoint, body, queryParams, retryCount + 1)
+            } else {
+                logger.error("Max retries reached for endpoint: ${endpoint}")
+            }
+        } else {
+            logger.error("API call failed with status: ${response.status}. Response: ${response.body}")
+        }
+    } catch (Exception e) {
+        logger.error("Error during API call: ${e.message}")
+    }
+    return null
+}
+
+if (issue.fields.issuetype.name != 'Reference') {
+    return
+}
+
+def statusChange = changelog.items.find {
+    (it as Map).field == 'status'
+} as Map
+
+logger.info("The status change of issue '${issue.key}': ${statusChange}.")
+
+if (!statusChange) {
+    logger.info("The status didn't change.")
+    return
+}
+
+if (!issue.fields.status.name in ['Stage 0', 'Stage 1', 'Stage 2', 'Stage 3', 'Stage 4', 'Stage 5', 'Stage 6', 'Stage 7']) {
+    logger.info("Status ${issue.fields.status.name} is not applicable.")
+    return
+}
+
+def parentKey = issue.fields.parent.key
+def jqlForStages = "issue in linkedIssues(${parentKey}) AND issuetype = Stage AND stage = '${issue.fields.status.name}' order by key ASC"
+logger.info("JQL for Stages: ${jqlForStages}")
+
+def allStages = callApiWithRetry("GET", "/rest/api/2/search", [:], ["jql": jqlForStages, "fields": "[]", "maxResults": "100"])
+if (!allStages) {
+    logger.error("Failed to retrieve stages for ${parentKey}")
+    return
+}
+
+logger.info("Total stages for ${parentKey}: ${allStages.issues.size()}")
+
+allStages.issues.each { stage ->
+    def jqlForItems = "parent in (${stage.key}) AND issuetype = 'Item' order by key desc"
+    logger.info("JQL for Items: ${jqlForItems}")
+
+    def allItemsForStage = callApiWithRetry("GET", "/rest/api/2/search", [:], ["jql": jqlForItems, "fields": "*all,-comment", "maxResults": "100"])
+    if (!allItemsForStage) {
+        logger.error("Failed to retrieve items for stage ${stage.key}")
+        return
+    }
+
+    allItemsForStage.issues.each { item ->
+        def taskTypeId = "10017"
+
+        def body = [
+            fields: [
+                summary: item.fields.summary,
+                description: [
+                    type: "doc",
+                    version: 1,
+                    content: [[
+                        type: "paragraph",
+                        content: [[
+                            type: "text",
+                            text: item.fields.description ?: ""
+                        ]]
+                    ]]
+                ],
+                project: [id: item.fields.project.id],
+                issuetype: [id: taskTypeId],
+                assignee: item.fields.assignee,
+                customfield_10047: item.fields.customfield_10047,
+                customfield_10060: item.fields.customfield_10060,
+                customfield_10063: item.fields.customfield_10063,
+                customfield_10064: item.fields.customfield_10064,
+                duedate: item.fields.duedate,
+                parent: [id: issue.id]
+            ]
+        ]
+
+        def response = callApiWithRetry("POST", "/rest/api/3/issue", body)
+
+        if (response) {
+            logger.info("Successfully created issue for item: ${item.key}")
+        } else {
+            logger.warn("Failed to create issue for item: ${item.key}")
+        }
+    }
+}
+
+logger.info("Completed successfully")
